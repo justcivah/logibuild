@@ -11,6 +11,9 @@ A digital logic circuit editor and simulator inspired by Logisim, written in Rus
 * Automatic orthogonal wire routing around components, with editable waypoints.
 * Integrated waveform viewer with CSV/VCD export (GTKWave).
 * Unlimited undo/redo, copy/paste, alignment; text project files that diff well in git.
+* Command palette (Ctrl+Shift+P) to find any command, component or circuit by name.
+* Optional MCP server (`--features mcp`): AI agents such as Claude Code can build, simulate and
+  inspect circuits in an open window, over a local socket.
 * Optional VHDL and Verilog support: an editor for the sources, compilation and synthesis with
   GHDL and Yosys into readable circuits (operators stay whole, hierarchy becomes subcircuits).
 

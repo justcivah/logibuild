@@ -22,6 +22,15 @@ The window has five areas:
 | Right | properties of the selection, or of the circuit when nothing is selected |
 | Bottom | status line: simulation time and state, frame rate, zoom |
 
+### Command palette
+
+**Ctrl+Shift+P** (or **View → Command palette…**) opens a search field over the window. Type
+part of a name to find any menu command, any component to place ("place and") or any circuit
+to open or place as a subcircuit. Matches whose name starts with the text come first. **↑**
+and **↓** move the highlight, **Enter** runs it, **Esc** or a click outside closes the
+palette. Commands that do not apply now are greyed out, with their shortcut on the right. The
+palette also opens the documentation of the component being placed or selected (like **F1**).
+
 ## Building circuits
 
 ### Placing components
@@ -291,10 +300,37 @@ dark as the desktop is, updated when it changes), **Light** or **Dark** — and 
 text size, from 90% to 175% (100% is the default). The choices are kept in
 `$XDG_CONFIG_HOME/logibuild/settings` (usually `~/.config/logibuild/settings`).
 
+## Agents (MCP)
+
+A build with the optional `mcp` feature lets an AI agent, such as Claude Code, drive an open
+window through the [Model Context Protocol](https://modelcontextprotocol.io): you ask the agent
+for a circuit and watch it being placed, wired and simulated.
+
+```bash
+cargo build --release -p logibuild --features mcp
+logibuild --mcp examples/stopwatch.lbc     # this window accepts agents
+claude mcp add logibuild -- /path/to/logibuild --mcp-bridge
+```
+
+`--mcp` makes the window listen on a local socket: `$XDG_RUNTIME_DIR/logibuild.sock` (or the
+temporary folder) on Linux and macOS, readable by your user only, and the named pipe
+`\\.\pipe\logibuild` on Windows. Nothing listens without the option. `--mcp-bridge` is the MCP
+server the agent starts: it relays the agent's messages to that window, and opens one when
+none is listening. `--mcp=NAME` and `--mcp-bridge=NAME` choose another socket name, to drive
+several windows. The status line shows **Agent** while an agent is connected.
+
+The agent can read the project and the shown circuit, list the component kinds with their
+pins, place, move, change and remove components, connect pins, create, open and rename
+circuits, undo, redo and save; set inputs, run, pause, reset, step or advance the simulation
+and read the values on pins; find and run any command palette entry; and take a screenshot of
+the window. Its edits go through the undo history like yours. It cannot open file dialogs or
+quit, and it waits while a dialog is open.
+
 ## Keyboard shortcuts
 
 | Action | Keys |
 | --- | --- |
+| Command palette | Ctrl+Shift+P |
 | New / Open / Save / Save as | Ctrl+N / Ctrl+O / Ctrl+S / Ctrl+Shift+S |
 | Undo / Redo | Ctrl+Z / Ctrl+Shift+Z or Ctrl+Y |
 | Copy / Cut / Paste / Duplicate | Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+D |

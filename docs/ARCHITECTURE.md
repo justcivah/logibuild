@@ -129,15 +129,29 @@ the circuits.
 | `autoroute` | The automatic router. |
 | `waveform` | The timing diagram canvas. |
 | `palette`, `props` | Left and right panels. |
+| `commands` | Command palette: the commands of the menus, components and circuits, filtered by what is typed. |
 | `theme` | Light and dark colour schemes (from KDE Breeze), widget styles (KDE Plasma look), embedded Noto Sans, signal colours, text scaling (`fs`). |
 | `settings` | Colour scheme, text size and HDL options, saved in the user configuration directory. |
 | `hdl` | (feature `hdl`) HDL panel: sources, editor with highlighting, jobs run on a thread, file polling, applying a synthesis. |
 | `icons` | Symbolic 16 px toolbar and menu icons (inline SVG, tinted per state). |
+| `mcp` | (feature `mcp`) Model Context Protocol server for agents: local socket listener, stdio bridge, JSON-RPC, tools. |
 
 The application owns the project, the history, the selection and one simulator per
 simulation root. The canvas keeps only transient interaction state and publishes
 `EditorEvent`s; all edits go through `history` commands. After each edit the geometry
 and routes of the visible circuit are recomputed and the simulator is refreshed.
+
+### Agents (MCP)
+
+With `--mcp`, a subscription runs a thread listening on a local socket (`interprocess`: a Unix
+domain socket file with mode 0600, or a named pipe on Windows). Each newline-delimited JSON-RPC
+message becomes a `Message::Mcp` handled by `App::update`, which sends the answer back through
+a channel; the thread answers one message at a time. Tools reuse the messages of the user
+interface and `App::exec`, so agent edits are undoable and the window shows them at once. When
+an action fails, the tool takes the message of the dialog `App::warn` opened and returns it to
+the agent, so agent errors do not interrupt the user. The
+screenshot tool answers later, from the task that captures the window. MCP clients start
+servers on stdio, so `--mcp-bridge` only copies bytes between stdio and the socket.
 
 ### Automatic routing
 

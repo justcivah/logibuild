@@ -20,6 +20,7 @@ use lb_core::value::Signal;
 
 use crate::autoroute;
 use crate::canvas::{CircuitCache, Editor, EditorEvent, Selection, Tool, orient_wire};
+use crate::commands::{self, CommandPalette};
 use crate::icons::{self, Emblem, Icon};
 use crate::routing;
 use crate::settings::{Scheme, Settings, TEXT_SIZE_RANGE, TEXT_SIZES};
@@ -165,6 +166,20 @@ pub enum Menu {
     Settings,
 }
 
+/// Which commands of the menus and the command palette apply now.
+pub struct Enabled {
+    /// Components are selected.
+    pub sel: bool,
+    /// Something is selected (components or wires).
+    pub delete: bool,
+    pub paste: bool,
+    /// Rotate and flip: a selection or a component being placed.
+    pub transform: bool,
+    pub align: bool,
+    /// The shown circuit is simulated.
+    pub sim: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
     Left,
@@ -252,6 +267,14 @@ pub enum Message {
     /// The desktop switched between light and dark.
     SystemTheme(iced::theme::Mode),
     ToggleWaveform,
+    // Command palette
+    OpenCommands,
+    CloseCommands,
+    CommandQuery(String),
+    /// Move the highlight up (-1) or down (+1).
+    CommandMove(i32),
+    /// Run the match with this index.
+    CommandRun(usize),
     // Palette, circuits
     Search(String),
     /// Collapse or expand a section of the component library.
@@ -291,6 +314,12 @@ pub enum Message {
     StartResize(Split),
     ResizeMove(Point),
     ResizeEnd,
+    // Agents
+    #[cfg(feature = "mcp")]
+    Mcp(crate::mcp::Event),
+    /// A screenshot an agent asked for (JSON-RPC id, where to answer).
+    #[cfg(feature = "mcp")]
+    McpScreenshot(serde_json::Value, crate::mcp::Reply, Option<window::Screenshot>),
 }
 
 pub struct App {
@@ -329,6 +358,8 @@ pub struct App {
     pub modal: Option<Modal>,
     /// The documentation shown by [`Modal::Help`], parsed.
     help: Vec<iced::widget::markdown::Item>,
+    /// The command palette, while it is open.
+    pub commands: Option<CommandPalette>,
     after_save: Option<After>,
     pub show_grid: bool,
     /// Text being typed in property fields, by key.
@@ -352,6 +383,9 @@ pub struct App {
     system_dark: bool,
     #[cfg(feature = "hdl")]
     pub hdl: crate::hdl::Hdl,
+    /// The server agents connect to, when started with `--mcp`.
+    #[cfg(feature = "mcp")]
+    pub mcp: Option<crate::mcp::Server>,
 }
 
 impl App {
@@ -404,6 +438,7 @@ impl App {
             canvas_size: Size::new(800.0, 600.0),
             modal: None,
             help: Vec::new(),
+            commands: None,
             after_save: None,
             show_grid: true,
             drafts: HashMap::new(),
@@ -424,6 +459,8 @@ impl App {
             system_dark: false,
             #[cfg(feature = "hdl")]
             hdl: crate::hdl::Hdl::default(),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         };
         app.apply_settings();
         app.refresh();
@@ -496,7 +533,7 @@ impl App {
         self.sims.get(&self.loc().root).map(|s| &s.sim)
     }
 
-    fn sim_mut(&mut self) -> Option<&mut Simulator> {
+    pub(crate) fn sim_mut(&mut self) -> Option<&mut Simulator> {
         let root = self.loc().root.clone();
         self.sims.get_mut(&root).map(|s| &mut s.sim)
     }
@@ -606,7 +643,8 @@ impl App {
         c
     }
 
-    pub(crate) fn exec(&mut self, mut cmd: Command) {
+    /// Runs an edit; returns whether it changed the project.
+    pub(crate) fn exec(&mut self, mut cmd: Command) -> bool {
         // Circuits synthesized from HDL change only with their sources.
         let edits = cmd.ops.iter().any(|op| {
             matches!(
@@ -615,13 +653,15 @@ impl App {
             )
         });
         if edits && self.project.is_hdl(&cmd.circuit) {
-            return;
+            return false;
         }
         self.tidy_wires(&mut cmd);
-        if self.history.execute(&mut self.project, cmd) {
+        let changed = self.history.execute(&mut self.project, cmd);
+        if changed {
             self.generation += 1;
             self.refresh();
         }
+        changed
     }
 
     /// Adds to `cmd` the tidying of the waypoints of the wires attached to
@@ -776,7 +816,7 @@ impl App {
         crate::hdl::project_loaded(self);
     }
 
-    fn save_to(&mut self, path: PathBuf) -> bool {
+    pub(crate) fn save_to(&mut self, path: PathBuf) -> bool {
         let path = if path.extension().is_none() { path.with_extension(io::EXTENSION) } else { path };
         #[cfg(feature = "hdl")]
         {
@@ -917,6 +957,36 @@ impl App {
         let time = sim.time();
         sim.trace.add(name.clone(), net, value, time, Some((inst.into(), comp, pin)));
         self.wave.visible = true;
+    }
+
+    /// Settles the simulation now rather than over the next frames.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub(crate) fn settle(&mut self) {
+        let Some(sim) = self.sim_mut() else { return };
+        match sim.settle(1_000_000) {
+            Ok(settled) => self.pending_settle = !settled,
+            Err(_) => self.report_osc(),
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    fn mcp_event(&mut self, event: crate::mcp::Event) -> Task<Message> {
+        use crate::mcp::Event;
+        match event {
+            Event::Listening => {}
+            Event::Failed(e) => {
+                self.warn(format!("Cannot listen for agents: {e}"));
+                self.mcp = None;
+            }
+            Event::Connected(on) => {
+                if let Some(server) = &mut self.mcp {
+                    server.connected = on;
+                }
+            }
+            Event::Call(call) => return crate::mcp::handle(self, call),
+            Event::Frame => return self.mcp.as_mut().map_or(Task::none(), crate::mcp::frame),
+        }
+        Task::none()
     }
 
     fn report_osc(&mut self) {
@@ -1157,6 +1227,10 @@ impl App {
                 self.drafts.insert("cfg.trace".into(), s);
             }
             Message::Frame(now) => self.frame(now),
+            #[cfg(feature = "mcp")]
+            Message::Mcp(event) => return self.mcp_event(event),
+            #[cfg(feature = "mcp")]
+            Message::McpScreenshot(id, reply, shot) => crate::mcp::screenshot_taken(id, reply, shot),
 
             // ---- view
             Message::FitView => self.fit_view(),
@@ -1170,6 +1244,39 @@ impl App {
             }
             Message::ToggleGrid => self.show_grid = !self.show_grid,
             Message::ToggleWaveform => self.wave.visible = !self.wave.visible,
+
+            // ---- command palette
+            Message::OpenCommands => {
+                if self.modal.is_some() {
+                    return Task::none();
+                }
+                self.commands = Some(CommandPalette::default());
+                return Task::batch([
+                    iced::widget::operation::focus(commands::INPUT_ID),
+                    iced::widget::operation::select_all(commands::INPUT_ID),
+                ]);
+            }
+            Message::CloseCommands => self.commands = None,
+            Message::CommandQuery(q) => {
+                if let Some(p) = &mut self.commands {
+                    *p = CommandPalette { query: q, ..CommandPalette::default() };
+                }
+            }
+            Message::CommandMove(delta) => {
+                if let Some(p) = &self.commands {
+                    let n = commands::matches(self, p).len();
+                    if let Some(p) = &mut self.commands {
+                        p.step(delta, n);
+                    }
+                }
+            }
+            Message::CommandRun(i) => {
+                let Some(p) = &self.commands else { return Task::none() };
+                if let Some(e) = commands::matches(self, p).into_iter().nth(i).filter(|e| e.enabled) {
+                    self.commands = None;
+                    return self.update(e.msg);
+                }
+            }
             Message::SetScheme(scheme) => self.change_settings(Settings { scheme, ..self.settings.clone() }),
             Message::SetTextSize(n) => {
                 let text_size = n.clamp(*TEXT_SIZE_RANGE.start(), *TEXT_SIZE_RANGE.end());
@@ -1461,6 +1568,10 @@ impl App {
         #[cfg(feature = "hdl")]
         if let Message::Hdl(m) = message {
             return matches!(m, crate::hdl::Msg::Poll | crate::hdl::Msg::Done(..));
+        }
+        #[cfg(feature = "mcp")]
+        if matches!(message, Message::Mcp(_) | Message::McpScreenshot(..)) {
+            return true;
         }
         let _ = message;
         false
@@ -1847,20 +1958,24 @@ impl App {
         Task::none()
     }
 
+    /// The component whose documentation F1 shows: the one being placed or selected.
+    pub(crate) fn help_kind(&self) -> Option<Kind> {
+        match &self.tool {
+            Tool::Place { kind, .. } => Some(*kind),
+            _ if self.selection.comps.len() == 1 => {
+                self.selection.comps.first().and_then(|&id| self.circuit().component(id)).map(|c| c.kind)
+            }
+            _ => None,
+        }
+    }
+
     fn key(&mut self, ev: keyboard::Event) -> Task<Message> {
         // F1: the documentation of the component being placed or selected.
         if let keyboard::Event::KeyPressed { key: Key::Named(Named::F1), .. } = &ev
             && self.modal.is_none()
             && !self.hdl_shown()
         {
-            let kind = match &self.tool {
-                Tool::Place { kind, .. } => Some(*kind),
-                _ if self.selection.comps.len() == 1 => {
-                    self.selection.comps.first().and_then(|&id| self.circuit().component(id)).map(|c| c.kind)
-                }
-                _ => None,
-            };
-            return kind.map_or(Task::none(), |k| self.update(Message::ShowHelp(k)));
+            return self.help_kind().map_or(Task::none(), |k| self.update(Message::ShowHelp(k)));
         }
         // A selected keyboard component takes the keys, except shortcuts
         // with Ctrl or Alt.
@@ -1868,6 +1983,7 @@ impl App {
             && !modifiers.command()
             && !modifiers.alt()
             && self.modal.is_none()
+            && self.commands.is_none()
             && let Some(id) = self.typing_target()
         {
             let code = match key.as_ref() {
@@ -1889,6 +2005,10 @@ impl App {
             }
             return Task::none();
         }
+        // The open command palette handles its own keys (see `subscription`).
+        if self.commands.is_some() {
+            return Task::none();
+        }
         match ev {
             keyboard::Event::KeyPressed { key, modifiers, repeat, .. } => {
                 let ctrl = modifiers.command();
@@ -1900,6 +2020,7 @@ impl App {
                         (true, true, "s") => Some(Message::SaveAs),
                         (true, _, "o") => Some(Message::Open),
                         (true, _, "n") => Some(Message::New),
+                        (true, true, "p") => Some(Message::OpenCommands),
                         _ => None,
                     },
                     k if self.hdl_shown() && k != Key::Named(Named::Escape) => None,
@@ -1934,6 +2055,7 @@ impl App {
                             (true, true, "s") => Some(Message::SaveAs),
                             (true, _, "o") => Some(Message::Open),
                             (true, _, "n") => Some(Message::New),
+                            (true, true, "p") => Some(Message::OpenCommands),
                             (true, false, "z") => Some(Message::Undo),
                             (true, true, "z") | (true, _, "y") => Some(Message::Redo),
                             (true, _, "c") => Some(Message::Copy),
@@ -1981,6 +2103,23 @@ impl App {
         }
         #[cfg(feature = "hdl")]
         subs.push(crate::hdl::subscription(self));
+        #[cfg(feature = "mcp")]
+        if let Some(server) = &self.mcp {
+            subs.push(crate::mcp::subscription(server));
+        }
+        if self.commands.is_some() {
+            // Also the keys the focused search field captures: Escape would
+            // only unfocus it.
+            subs.push(iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => match key.as_ref() {
+                    Key::Named(Named::Escape) => Some(Message::CloseCommands),
+                    Key::Named(Named::ArrowUp) => Some(Message::CommandMove(-1)),
+                    Key::Named(Named::ArrowDown) => Some(Message::CommandMove(1)),
+                    _ => None,
+                },
+                _ => None,
+            }));
+        }
         if self.resizing.is_some() {
             subs.push(iced::event::listen_with(|event, _status, _window| match event {
                 iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => Some(Message::ResizeMove(position)),
@@ -2013,6 +2152,9 @@ impl App {
         let mut layers: Vec<Element<Message>> = vec![base.into()];
         if let Some(m) = self.menu {
             layers.push(self.menu_overlay(m));
+        }
+        if let Some(p) = &self.commands {
+            layers.push(commands::view(self, p));
         }
         if let Some(modal) = &self.modal {
             layers.push(self.modal_overlay(modal));
@@ -2168,6 +2310,19 @@ impl App {
     }
 
     /// The menus shown in the menu bar.
+    /// Which commands apply to the current selection, tool and simulation.
+    pub fn enabled(&self) -> Enabled {
+        let sel = !self.selection.comps.is_empty();
+        Enabled {
+            sel,
+            delete: !self.selection.is_empty(),
+            paste: !self.clipboard.is_empty(),
+            transform: sel || matches!(self.tool, Tool::Place { .. }),
+            align: self.selection.comps.len() > 1,
+            sim: self.sim().is_some(),
+        }
+    }
+
     fn menus(&self) -> Vec<(&'static str, Menu)> {
         let mut m =
             vec![("File", Menu::File), ("Edit", Menu::Edit), ("Simulation", Menu::Simulation), ("View", Menu::View)];
@@ -2308,10 +2463,7 @@ impl App {
             tinted(Some(i), Some(c), label, "", msg, true)
         };
         let sep = || -> Element<Message> { container(theme::hline()).padding([4, 6]).into() };
-        let sel = !self.selection.comps.is_empty();
-        let transform = sel || matches!(self.tool, Tool::Place { .. });
-        let align = self.selection.comps.len() > 1;
-        let has_sim = self.sim().is_some();
+        let Enabled { sel, delete, paste, transform, align, sim: has_sim } = self.enabled();
         let items: Vec<Element<Message>> = match m {
             Menu::File => vec![
                 entry(Some(Icon::New), "New", "Ctrl+N", Message::New, true),
@@ -2342,9 +2494,9 @@ impl App {
                 sep(),
                 entry(None, "Cut", "Ctrl+X", Message::Cut, sel),
                 entry(None, "Copy", "Ctrl+C", Message::Copy, sel),
-                entry(None, "Paste", "Ctrl+V", Message::Paste, !self.clipboard.is_empty()),
+                entry(None, "Paste", "Ctrl+V", Message::Paste, paste),
                 entry(None, "Duplicate", "Ctrl+D", Message::Duplicate, sel),
-                entry(Some(Icon::Delete), "Delete", "Del", Message::Delete, !self.selection.is_empty()),
+                entry(Some(Icon::Delete), "Delete", "Del", Message::Delete, delete),
                 entry(None, "Select all", "Ctrl+A", Message::SelectAll, true),
                 sep(),
                 entry(Some(Icon::Rotate), "Rotate", "R", Message::Rotate, transform),
@@ -2398,6 +2550,8 @@ impl App {
                 sep(),
                 toggle("Grid", self.show_grid, Message::ToggleGrid),
                 toggle("Waveform", self.wave.visible, Message::ToggleWaveform),
+                sep(),
+                entry(Some(Icon::Search), "Command palette…", "Ctrl+Shift+P", Message::OpenCommands, true),
             ],
             Menu::Settings => {
                 let heading = |label: &str| -> Element<Message> {
@@ -2640,6 +2794,15 @@ impl App {
         Vec::new()
     }
 
+    /// "Agent" in the status bar while an agent is connected.
+    fn agent_info(&self) -> &'static str {
+        #[cfg(feature = "mcp")]
+        if self.mcp.as_ref().is_some_and(|s| s.connected) {
+            return "Agent";
+        }
+        ""
+    }
+
     fn statusbar(&self) -> Element<'_, Message> {
         let sim_info = match self.sim() {
             Some(s) => {
@@ -2666,6 +2829,7 @@ impl App {
                 text(sim_info).size(theme::fs(theme::SMALL)).color(theme::colors().muted),
                 theme::vline(),
                 text(zoom).size(theme::fs(theme::SMALL)).color(theme::colors().muted),
+                text(self.agent_info()).size(theme::fs(theme::SMALL)).color(theme::colors().link),
             ]
             .spacing(12)
             .height(theme::fs(14.0))

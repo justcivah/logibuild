@@ -10,9 +10,15 @@ license.workspace = true
 default = ["hdl"]
 # VHDL and Verilog sources synthesized into circuits (GHDL, Yosys).
 hdl = ["dep:lb_hdl"]
+# Model Context Protocol server over a local socket, for AI agents (opt-in).
+mcp = ["dep:serde_json", "dep:interprocess", "dep:png", "dep:base64"]
 
 [dependencies]
 lb_core.workspace = true
 lb_hdl = { workspace = true, optional = true }
 iced = { version = "0.14", features = ["canvas", "tokio", "svg", "advanced", "markdown"] }
 rfd = "0.17"
+serde_json = { version = "1", optional = true }
+png = { version = "0.17", optional = true }
+base64 = { version = "0.22", optional = true }
+interprocess = { version = "2", optional = true }

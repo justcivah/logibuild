@@ -704,6 +704,94 @@ fn a_waypoint_dropped_on_a_straight_run_is_removed() {
     assert!(wire(&app).path.is_empty());
 }
 
+/// Presses a character key with any modifiers.
+fn press_with(app: &mut App, c: &str, modifiers: iced::keyboard::Modifiers) {
+    use iced::keyboard::{Key, Location, key};
+    let _ = app.update(Message::Key(iced::keyboard::Event::KeyPressed {
+        key: Key::Character(c.into()),
+        modified_key: Key::Character(c.into()),
+        physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+        location: Location::Standard,
+        modifiers,
+        text: Some(c.into()),
+        repeat: false,
+    }));
+}
+
+fn open_commands(app: &mut App) {
+    use iced::keyboard::Modifiers;
+    press_with(app, "P", Modifiers::CTRL | Modifiers::SHIFT);
+    assert!(app.commands.is_some(), "Ctrl+Shift+P opens the command palette");
+}
+
+/// Types `query` in the palette and runs the first match.
+fn run_command(app: &mut App, query: &str) {
+    let _ = app.update(Message::CommandQuery(query.into()));
+    let _ = app.update(Message::CommandRun(0));
+}
+
+#[test]
+fn command_palette_opens_and_closes() {
+    let mut app = app();
+    open_commands(&mut app);
+    let _ = app.update(Message::CloseCommands);
+    assert!(app.commands.is_none());
+    // Shortcuts are off while it is open: S does not step the simulation.
+    open_commands(&mut app);
+    let t = app.sim().map(|s| s.time());
+    press_with(&mut app, "s", iced::keyboard::Modifiers::empty());
+    assert_eq!(app.sim().map(|s| s.time()), t);
+    assert!(app.commands.is_some());
+}
+
+#[test]
+fn command_palette_ranks_and_filters() {
+    let app = app();
+    let all = crate::commands::entries(&app);
+    let labels =
+        |q: &str| -> Vec<String> { crate::commands::filter(all.clone(), q).into_iter().map(|e| e.label).collect() };
+    assert_eq!(labels("").len(), all.len());
+    assert_eq!(labels("rot")[0], "Edit: Rotate");
+    assert_eq!(labels("ZOOM IN"), ["View: Zoom in"]);
+    assert_eq!(labels("place and")[0], "Place: AND");
+    assert!(labels("no such command").is_empty());
+}
+
+#[test]
+fn command_palette_runs_commands() {
+    use crate::canvas::Tool;
+    let mut app = app();
+    open_commands(&mut app);
+    run_command(&mut app, "place not");
+    assert!(app.commands.is_none(), "running a command closes the palette");
+    assert!(matches!(app.tool, Tool::Place { kind: Kind::Not, .. }));
+
+    // A disabled command does nothing and leaves the palette open.
+    let mut app = self::app();
+    open_commands(&mut app);
+    run_command(&mut app, "edit undo");
+    assert!(app.commands.is_some());
+
+    let grid = app.show_grid;
+    run_command(&mut app, "grid");
+    assert_eq!(app.show_grid, !grid);
+}
+
+#[test]
+fn command_palette_highlight_wraps_and_scrolls() {
+    use crate::commands::ROWS;
+    let mut app = app();
+    open_commands(&mut app);
+    let n = crate::commands::matches(&app, app.commands.as_ref().unwrap()).len();
+    assert!(n > ROWS);
+    let _ = app.update(Message::CommandMove(-1));
+    let p = app.commands.as_ref().unwrap();
+    assert_eq!((p.selected, p.first), (n - 1, n - ROWS));
+    let _ = app.update(Message::CommandMove(1));
+    let p = app.commands.as_ref().unwrap();
+    assert_eq!((p.selected, p.first), (0, 0));
+}
+
 // TEMP-PROFILE-BEGIN
 #[test]
 #[ignore]
